@@ -1,13 +1,16 @@
 import numpy as np
 from sqlalchemy import select
 from sklearn.feature_selection import mutual_info_regression
-from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error
 from .models import Probe,Sweep,Pressure
 from .services import selected,assign,source_checksum
+
+def holdout_split(n):
+    from sklearn.model_selection import train_test_split
+    return train_test_split(np.arange(n),test_size=.2,random_state=42)
 
 def calculate(s,l):
     probes=s.scalars(select(Probe).where(Probe.enabled==True).order_by(Probe.id)).all()
@@ -16,7 +19,7 @@ def calculate(s,l):
     values={(p.sweep_id,p.probe_id):p.pascal for p in s.scalars(select(Pressure))}
     try:x=np.array([[values[(r.id,p.id)] for p in probes]for r in rows]);y=np.array([r.lift for r in rows])
     except KeyError:raise ValueError('扫角存在缺测点，不能计算贡献')
-    ix=np.arange(len(rows));train,test=train_test_split(ix,test_size=.2,random_state=42)
+    train,test=holdout_split(len(rows))
     # Selection and standardization see training rows only. Holdout is evaluation only.
     mi=mutual_info_regression(x[train],y[train],random_state=42)
     order=np.argsort(-mi,kind='stable')

@@ -4,7 +4,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from .models import Layout,Probe
 from .run_models import TunnelRun
-from .calibration_service import locked,current_certificate,view as certificate_view
+from .calibration_service import locked,view as certificate_view
 from .services import pack,pack_layout,selected,audit
 
 def signed_layout(s,id):
@@ -22,6 +22,7 @@ def revise(s,id,d,u):
     for k,v in d.model_dump().items():setattr(x,k,v)
     audit(s,u,'修订开车核对 '+x.code);return pack(x)
 def start(s,id,u):
+    from .lift_service import recheck_run
     x=locked(s,TunnelRun,id)
     if x.state!='planned':raise HTTPException(409,'仅计划试验可开车，不得重复启动')
     l=signed_layout(s,x.layout_id)
@@ -30,14 +31,19 @@ def start(s,id,u):
     if any(x.checklist.get(k) is not True for k in keys):raise HTTPException(409,'风道清场、急停测试与模型固定联锁须全部确认')
     ids=selected(s,l.id)
     if not ids:raise HTTPException(409,'已签布置缺少测点')
-    probes=[locked(s,Probe,i) for i in ids];certificates=[]
+    # 先按升力偏差锁序（Layout→升力核算→测点→证书）复核，再取测点与证书快照
+    lift_evidence,certs=recheck_run(s,x,u)
+    if set(certs)!=set(ids):raise HTTPException(409,'复核证书与布置测点不一致')
+    probes=[locked(s,Probe,i) for i in ids]
     for p in probes:
         if not p.enabled:raise HTTPException(409,f'{p.code}已经停用，不能开车')
-        certificates.append(certificate_view(s,current_certificate(s,p)))
+    certificates=[certificate_view(s,certs[p.id]) for p in probes]
     from .mount_service import readiness
     mounting=readiness(s,x)
     now=datetime.now(timezone.utc).isoformat()
-    x.snapshot=deepcopy({'layout':pack_layout(s,l),'probes':[pack(p) for p in probes],'certificates':certificates,'speed':x.speed,'target_angle':x.target_angle,'checklist':x.checklist,'checked_at':now,'mounting':mounting})
+    x.snapshot=deepcopy({'layout':pack_layout(s,l),'probes':[pack(p) for p in probes],'certificates':certificates,
+                         'lift_check':lift_evidence,'speed':x.speed,'target_angle':x.target_angle,
+                         'checklist':x.checklist,'checked_at':now,'mounting':mounting})
     x.state='running';x.started_at=now;x.started_by=u.email;audit(s,u,'负责人开车 '+x.code);return pack(x)
 def finish(s,id,d,u):
     x=locked(s,TunnelRun,id)

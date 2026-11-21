@@ -32,3 +32,6 @@ target/
 *.o
 *.obj
 .DS_Store
+
+# 测试用临时 SQLite
+backend/tests/test.sqlite3

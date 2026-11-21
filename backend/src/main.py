@@ -13,18 +13,25 @@ from .services import get,pack,pack_layout,pack_sweep,audit,invalidate,assign,ch
 from .middlewares import RequestTrace,BurstGuard
 from .readiness_routes import router as readiness_router
 from .testcycle_routes import router as testcycle_router
+from .lift_routes import router as lift_router
+from . import lift_service
 from .constants import ROLES,ZONES,LAYOUT_STATES
 r=redis.Redis.from_url(os.environ['REDIS_URL'],decode_responses=True)
 @asynccontextmanager
 async def lifespan(app):
     Base.metadata.create_all(engine)
+    try:
+        from .db import Session
+        from .lift_service import backfill
+        with Session() as s:backfill(s);s.commit()
+    except Exception:logging.exception('lift backfill failed')
     if os.getenv('SEED_DEMO','true')=='true':
         try:
             from scripts.seed_demo import seed
             seed()
         except Exception:logging.exception('seed failed')
     yield
-app=FastAPI(title='翼衡 · 风洞测点精简审签',lifespan=lifespan);app.include_router(readiness_router);app.include_router(testcycle_router);app.add_middleware(RequestTrace);app.add_middleware(BurstGuard)
+app=FastAPI(title='翼衡 · 风洞测点精简审签',lifespan=lifespan);app.include_router(readiness_router);app.include_router(testcycle_router);app.include_router(lift_router);app.add_middleware(RequestTrace);app.add_middleware(BurstGuard)
 @app.exception_handler(IntegrityError)
 async def conflict(req,exc):return JSONResponse({'detail':'编号重复、测点重复或关联条件不满足，请核对'},409)
 @app.get('/health')
@@ -72,16 +79,21 @@ def enqueue(s,l):
     except Exception:l.status='failed';s.commit();raise HTTPException(503,'计算队列暂不可用，请重试')
 @app.post('/layouts')
 def add_layout(p:LayoutInput,s=Depends(db_session),u=Depends(writers)):
-    l=Layout(**p.model_dump(),auto_select=True,status='calculating');s.add(l);audit(s,u,'建立通道方案 '+p.code);enqueue(s,l);return pack_layout(s,l)
+    l=Layout(**p.model_dump(exclude={'limit_n'}),auto_select=True,status='calculating');s.add(l);s.flush()
+    lift_service.begin(s,l,p.limit_n)
+    audit(s,u,f'建立通道方案 {p.code}，升力偏差上限 {p.limit_n}N');enqueue(s,l);return pack_layout(s,l)|{'lift_check':lift_service.summary(s,l)}
 @app.put('/layouts/{lid}/probes')
 def reselect(lid:int,p:Selection,s=Depends(db_session),u=Depends(writers)):
     l=get(s,Layout,lid)
     if l.status in ('signed','calculating'):raise HTTPException(409,'已审签或计算中的方案不能改点')
-    assign(s,l,p.probe_ids);l.auto_select=False;audit(s,u,'人工修订测点 '+l.code);enqueue(s,l);return pack_layout(s,l)
+    assign(s,l,p.probe_ids);lift_service.reset(s,l)
+    l.auto_select=False;audit(s,u,'人工修订测点 '+l.code);enqueue(s,l);return pack_layout(s,l)
 @app.post('/layouts/{lid}/sign')
 def sign(lid:int,s=Depends(db_session),u=Depends(admin)):
     l=s.query(Layout).filter_by(id=lid).with_for_update().one_or_none()
     if not l:raise HTTPException(404,'布置方案不存在')
-    check_sign(s,l);l.status='signed';l.signed_by=u.email;audit(s,u,'审签布置 '+l.code);s.commit();return pack_layout(s,l)
+    check_sign(s,l)
+    lift_service.sign_with_layout(s,l,u)
+    l.status='signed';l.signed_by=u.email;audit(s,u,'审签布置 '+l.code);s.commit();return pack_layout(s,l)|{'lift_check':lift_service.summary(s,l)}
 @app.get('/audits')
 def audits(s=Depends(db_session),u=Depends(current)):return [pack(x)for x in s.scalars(select(Audit).order_by(Audit.id.desc()).limit(30))]

@@ -18,5 +18,8 @@ class SweepInput(BaseModel):
 class LayoutInput(BaseModel):
     code:str=Field(min_length=1,max_length=40)
     max_channels:int=Field(ge=1,le=12)
+    limit_n:float=Field(gt=0,le=10000,allow_inf_nan=False)
+class LiftLimitInput(BaseModel):
+    limit_n:float=Field(gt=0,le=10000,allow_inf_nan=False)
 class Selection(BaseModel):
     probe_ids:list[int]=Field(min_length=1,max_length=12)
